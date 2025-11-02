@@ -164,7 +164,7 @@ def load_project(name: str) -> Optional[Project]:
                 T_left=row[3],
                 T_inf=row[4],
                 h=row[5],
-                result=json.loads(row[6])
+                result=json.loads(row[6]) if row[6] else None
             )
         return None
     except Exception as e:
