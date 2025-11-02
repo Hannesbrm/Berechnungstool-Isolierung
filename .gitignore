@@ -1,0 +1,25 @@
+# Virtuelle Umgebungen
+.venv/
+venv/
+
+# Python Cache / Bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Projekt-Datenbank (lokal)
+projects.db
+
+# Tests/Reports/Cache
+.coverage
+pytest_cache/
+.mypy_cache/
+ruff_cache/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Betriebssystem
+.DS_Store
+Thumbs.db
