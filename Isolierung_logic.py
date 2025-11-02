@@ -489,8 +489,168 @@ def solve_multilayer_kT(
     T_left_C: float,
     T_inf_C: float,
     h_W_m2K: float,
+    *,
+    cells_per_layer: int = 25,
+    tol: float = 1e-3,
+    max_iter: int = 200,
+    clamp: bool = True,
 ) -> Dict[str, List[float] | float]:
-    raise NotImplementedError("Temperature dependent solver not yet implemented.")
+    if not layers:
+        raise ValueError("At least one layer is required for the computation.")
+    if h_W_m2K <= 0:
+        raise ValueError("Convective heat transfer coefficient must be positive.")
+
+    tol = float(tol)
+    if tol <= 0:
+        raise ValueError("Tolerance must be positive.")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be positive.")
+    if cells_per_layer <= 0:
+        raise ValueError("cells_per_layer must be positive.")
+
+    T_mid = 0.5 * (T_left_C + T_inf_C)
+    R_conv = 1.0 / h_W_m2K
+
+    material_cache: Dict[int, Material] = {}
+
+    layer_descriptors = []
+    constant_k_values = []
+
+    for layer in layers:
+        thickness_m = layer.thickness_mm / 1000.0
+        dx = thickness_m / cells_per_layer
+        if dx <= 0:
+            raise ValueError("Layer thickness must be positive.")
+
+        material: Optional[Material] = None
+        k_const: Optional[float] = None
+
+        if layer.mode == "material":
+            assert layer.material_id is not None
+            if layer.material_id not in material_cache:
+                material_cache[layer.material_id] = get_material(layer.material_id)
+            material = material_cache[layer.material_id]
+
+            if layer.use_kT:
+                if not material.k_points and material.k_const is None:
+                    raise ValueError(
+                        f"Material '{material.name}' does not provide k(T) data."
+                    )
+                k_const = interp_k(material, T_mid)
+            else:
+                if material.k_const is None:
+                    raise ValueError(
+                        f"Material '{material.name}' does not define a constant k value."
+                    )
+                k_const = material.k_const
+        else:  # custom layer
+            if layer.use_kT:
+                raise ValueError("Custom layers do not support temperature dependent k(T).")
+            assert layer.k_const is not None
+            k_const = layer.k_const
+
+        if k_const is None or k_const <= 0:
+            raise ValueError("Thermal conductivity must be positive for all layers.")
+
+        layer_descriptors.append(
+            {
+                "dx": dx,
+                "use_kT": layer.use_kT,
+                "material": material,
+                "k_const": k_const,
+            }
+        )
+
+        constant_k_values.append(k_const)
+
+    # Initial temperature profile using constant k values
+    linear_result = _solve_constant_k(layers, constant_k_values, T_left_C, T_inf_C, h_W_m2K)
+    q = float(linear_result["q_W_m2"])
+
+    cell_dx: List[float] = []
+    cell_material: List[Optional[Material]] = []
+    cell_use_kT: List[bool] = []
+    cell_k_const: List[float] = []
+
+    for descriptor in layer_descriptors:
+        dx = descriptor["dx"]
+        for _ in range(cells_per_layer):
+            cell_dx.append(dx)
+            cell_material.append(descriptor["material"])
+            cell_use_kT.append(descriptor["use_kT"])
+            cell_k_const.append(descriptor["k_const"])
+
+    T_profile = [T_left_C]
+    for dx, k_const in zip(cell_dx, cell_k_const):
+        R = dx / k_const
+        T_profile.append(T_profile[-1] - q * R)
+
+    x_m = [0.0]
+    for dx in cell_dx:
+        x_m.append(x_m[-1] + dx)
+
+    def _interp_material_k(material: Material, T_C: float) -> float:
+        if clamp:
+            return interp_k(material, T_C, mode="clamp")
+
+        points = sorted(material.k_points, key=lambda item: item[0])
+        if not points:
+            if material.k_const is None:
+                raise ValueError(
+                    f"Material '{material.name}' does not provide k(T) data for interpolation."
+                )
+            return material.k_const
+        min_T = points[0][0]
+        max_T = points[-1][0]
+        if T_C < min_T or T_C > max_T:
+            raise ValueError(
+                f"Temperature {T_C} °C is outside the available k(T) data for material '{material.name}'."
+            )
+        return interp_k(material, T_C, mode="clamp")
+
+    for iteration in range(int(max_iter)):
+        R_cells: List[float] = []
+        for idx, dx in enumerate(cell_dx):
+            if cell_use_kT[idx]:
+                material = cell_material[idx]
+                assert material is not None
+                T_cell = 0.5 * (T_profile[idx] + T_profile[idx + 1])
+                k_value = _interp_material_k(material, T_cell)
+            else:
+                k_value = cell_k_const[idx]
+
+            if k_value <= 0:
+                raise ValueError("Interpolated thermal conductivity must be positive.")
+
+            R_cells.append(dx / k_value)
+
+        q_new = (T_left_C - T_inf_C) / (sum(R_cells) + R_conv)
+
+        T_new = [T_left_C]
+        for R in R_cells:
+            T_new.append(T_new[-1] - q_new * R)
+
+        diff = max(abs(a - b) for a, b in zip(T_new, T_profile))
+        T_profile = T_new
+        q = q_new
+
+        if diff < tol:
+            break
+    else:
+        raise RuntimeError("Picard iteration did not converge within max_iter iterations.")
+
+    interface_T = [T_left_C]
+    cells_per_layer_cumsum = 0
+    for descriptor in layer_descriptors:
+        cells_per_layer_cumsum += cells_per_layer
+        interface_T.append(T_profile[cells_per_layer_cumsum])
+
+    return {
+        "q_W_m2": q,
+        "interface_T_C": interface_T,
+        "x_m": x_m,
+        "T_profile_C": T_profile,
+    }
 
 
 __all__ = [
