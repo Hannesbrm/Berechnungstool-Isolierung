@@ -1,9 +1,9 @@
 from Isolierung_ui import run_ui
-from Isolierung_logic import compute_multilayer
+
 
 def main():
     try:
-        run_ui(calculate_callback=compute_multilayer)
+        run_ui()
     except Exception as e:
         import traceback
         print("FEHLER:")

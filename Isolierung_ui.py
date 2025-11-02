@@ -8,23 +8,28 @@ import math
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LinearSegmentedColormap
+
+from matplotlib import cm
+from matplotlib.patches import Patch
 from matplotlib.figure import Figure
 
 from Isolierung_logic import (
+    Layer,
     Material,
-    compute_multilayer,
+    Project,
+    compute_multilayer_layers,
     create_material,
     delete_material,
-    delete_project,
     get_all_project_names,
     get_material,
     list_materials,
     load_project,
     save_project,
+    solve_multilayer_kT,
     update_material,
     upsert_k_points,
 )
@@ -613,338 +618,878 @@ class MaterialTab:
 # ---------------------------------------------------------------------------
 
 
-def run_ui(
-    calculate_callback: Optional[
-        Callable[[List[float], List[float], float, float, float], dict]
-    ] = None
-) -> None:
-    # --- Hilfsfunktionen ---
-    last_inputs: Dict[str, Optional[Tuple]] = {"value": None}
-    last_result: Dict[str, Optional[dict]] = {"value": None}
 
-    def _parse_inputs() -> Tuple[List[float], List[float], float, float, float]:
-        n = int(entry_layers.get())
-        thicknesses = [float(x.strip()) for x in entry_thickness.get().split(",") if x.strip()]
-        ks = [float(x.strip()) for x in entry_k.get().split(",") if x.strip()]
+def run_ui() -> None:
+    class CalculationTab:
+        """Encapsulates the interactive calculation tab."""
 
-        if len(thicknesses) != n or len(ks) != n:
-            raise ValueError("Anzahl der Werte muss der Schichtanzahl entsprechen.")
-        if any(t <= 0 for t in thicknesses):
-            raise ValueError("Alle Dicken müssen > 0 sein.")
-        if any(k <= 0 for k in ks):
-            raise ValueError("Alle Wärmeleitwerte müssen > 0 sein.")
+        def __init__(self, notebook: ttk.Notebook):
+            self.root = notebook.winfo_toplevel()
+            self.frame = ttk.Frame(notebook)
+            notebook.add(self.frame, text="Berechnung")
 
-        T_left = float(entry_T_left.get())
-        T_inf = float(entry_T_inf.get())
-        h_value = float(entry_h.get())
-        return thicknesses, ks, T_left, T_inf, h_value
+            self.layer_rows: List[Dict[str, object]] = []
+            self.materials: List[Material] = []
+            self.material_lookup: Dict[int, Material] = {}
+            self.material_names: List[str] = []
+            self.mode_display: Dict[str, str] = {"material": "Material", "custom": "Custom"}
+            self.mode_internal: Dict[str, str] = {v: k for k, v in self.mode_display.items()}
+            self.selected_index: Optional[int] = None
+            self.form_updating = False
+            self.form_enabled = False
+            self.tree_items: List[str] = []
 
-    def _calculate_with_callback(thicknesses, ks, T_left, T_inf, h_value):
-        callback = calculate_callback or compute_multilayer
-        return callback(thicknesses, ks, T_left, T_inf, h_value)
+            self._build_layout()
+            self.refresh_material_options()
+            self.refresh_tree()
 
-    def calculate() -> None:
-        try:
-            thicknesses, ks, T_left, T_inf, h = _parse_inputs()
-            result = _calculate_with_callback(thicknesses, ks, T_left, T_inf, h)
-            last_inputs["value"] = (tuple(thicknesses), tuple(ks), T_left, T_inf, h)
-            last_result["value"] = result
-            display_result(result)
-            plot_temperature_profile(
-                thicknesses,
-                result["interface_temperatures"],
-                result.get("temperature_positions_mm"),
-                result.get("temperature_labels"),
+        # ------------------------------------------------------------------
+        # UI setup
+        # ------------------------------------------------------------------
+
+        def _build_layout(self) -> None:
+            self.frame.columnconfigure(0, weight=3)
+            self.frame.columnconfigure(1, weight=2)
+            self.frame.rowconfigure(0, weight=1)
+            self.frame.rowconfigure(1, weight=1)
+
+            layers_frame = ttk.LabelFrame(self.frame, text="Schichten")
+            layers_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+            tree_container = ttk.Frame(layers_frame)
+            tree_container.pack(fill="both", expand=True)
+
+            columns = ("order", "mode", "material", "use_kT", "k_const", "thickness", "note")
+            self.tree = ttk.Treeview(
+                tree_container,
+                columns=columns,
+                show="headings",
+                selectmode="browse",
+                height=12,
             )
-        except Exception as exc:
-            last_result["value"] = None
-            messagebox.showerror("Fehler", str(exc))
+            self.tree.heading("order", text="#")
+            self.tree.heading("mode", text="Modus")
+            self.tree.heading("material", text="Material")
+            self.tree.heading("use_kT", text="k(T) nutzen")
+            self.tree.heading("k_const", text="k_const [W/mK]")
+            self.tree.heading("thickness", text="Dicke [mm]")
+            self.tree.heading("note", text="Notiz")
 
-    def display_result(result: dict) -> None:
-        output.delete("1.0", tk.END)
-        try:
-            output.insert(tk.END, f"Wärmestromdichte q = {result['q']:.3f} W/m²\n")
-            output.insert(tk.END, f"Gesamtwiderstand = {result['R_total']:.5f} m²K/W\n\n")
-            output.insert(tk.END, "Temperaturen entlang des Pfades (°C):\n")
-            labels = result.get("temperature_labels")
-            for i, temperature in enumerate(result["interface_temperatures"]):
-                label = labels[i] if labels and i < len(labels) else f"Grenzfläche {i}"
-                output.insert(tk.END, f"  {label}: {temperature:.2f}\n")
-        except Exception as exc:
-            output.insert(tk.END, f"Fehler beim Anzeigen des Ergebnisses: {exc}\n")
+            self.tree.column("order", width=40, anchor=tk.CENTER)
+            self.tree.column("mode", width=90, anchor=tk.CENTER)
+            self.tree.column("material", width=140, anchor=tk.W)
+            self.tree.column("use_kT", width=90, anchor=tk.CENTER)
+            self.tree.column("k_const", width=110, anchor=tk.CENTER)
+            self.tree.column("thickness", width=100, anchor=tk.CENTER)
+            self.tree.column("note", width=180, anchor=tk.W)
 
-    def save_current_project(name_entry: tk.Entry) -> Tuple[bool, str]:
-        name = name_entry.get().strip()
-        if not name:
-            return False, "Bitte einen Projektnamen eingeben."
+            self.tree.pack(side=tk.LEFT, fill="both", expand=True)
 
-        try:
-            thicknesses, ks, T_left, T_inf, h = _parse_inputs()
-        except ValueError as ve:
-            return False, f"Ungültige Eingabe: {ve}"
-        except Exception as exc:
-            return False, str(exc)
+            scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
+            scrollbar.pack(side=tk.RIGHT, fill="y")
+            self.tree.configure(yscrollcommand=scrollbar.set)
+            self.tree.tag_configure("error", background="#f8d7da")
+            self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        inputs_signature = (tuple(thicknesses), tuple(ks), T_left, T_inf, h)
+            layer_button_frame = ttk.Frame(layers_frame)
+            layer_button_frame.pack(fill="x", pady=(6, 0))
 
-        if last_inputs["value"] == inputs_signature and last_result.get("value"):
-            result = last_result["value"]
-        else:
+            self.btn_add = ttk.Button(layer_button_frame, text="+ Hinzufügen", command=self.add_layer)
+            self.btn_add.pack(side=tk.LEFT, padx=2)
+
+            self.btn_remove = ttk.Button(layer_button_frame, text="- Entfernen", command=self.remove_layer)
+            self.btn_remove.pack(side=tk.LEFT, padx=2)
+
+            self.btn_up = ttk.Button(layer_button_frame, text="↑", width=3, command=lambda: self.move_layer(-1))
+            self.btn_up.pack(side=tk.LEFT, padx=2)
+
+            self.btn_down = ttk.Button(layer_button_frame, text="↓", width=3, command=lambda: self.move_layer(1))
+            self.btn_down.pack(side=tk.LEFT, padx=2)
+
+            self.btn_clear = ttk.Button(layer_button_frame, text="Leeren", command=self.clear_layers)
+            self.btn_clear.pack(side=tk.LEFT, padx=8)
+
+            control_frame = ttk.Frame(self.frame)
+            control_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=10)
+            control_frame.columnconfigure(0, weight=1)
+            control_frame.rowconfigure(3, weight=1)
+
+            editor_frame = ttk.LabelFrame(control_frame, text="Schicht bearbeiten")
+            editor_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+            editor_frame.columnconfigure(1, weight=1)
+
+            ttk.Label(editor_frame, text="Modus:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+            self.mode_var = tk.StringVar()
+            self.mode_combo = ttk.Combobox(
+                editor_frame,
+                textvariable=self.mode_var,
+                values=list(self.mode_display.values()),
+                state="disabled",
+            )
+            self.mode_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+            self.mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_mode_change())
+
+            ttk.Label(editor_frame, text="Material:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+            self.material_var = tk.StringVar()
+            self.material_combo = ttk.Combobox(
+                editor_frame,
+                textvariable=self.material_var,
+                state="disabled",
+            )
+            self.material_combo.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+            self.material_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_material_selected())
+
+            self.use_kT_var = tk.BooleanVar(value=False)
+            self.use_kT_check = ttk.Checkbutton(
+                editor_frame,
+                text="k(T) nutzen",
+                variable=self.use_kT_var,
+                command=self._on_use_kT_toggle,
+            )
+            self.use_kT_check.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+
+            ttk.Label(editor_frame, text="k_const [W/mK]:").grid(row=3, column=0, sticky="w", padx=4, pady=2)
+            self.k_const_var = tk.StringVar()
+            self.k_const_entry = ttk.Entry(editor_frame, textvariable=self.k_const_var, state="disabled")
+            self.k_const_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=2)
+            self.k_const_var.trace_add("write", lambda *_: self._on_value_change("k_const"))
+
+            ttk.Label(editor_frame, text="Dicke [mm]:").grid(row=4, column=0, sticky="w", padx=4, pady=2)
+            self.thickness_var = tk.StringVar()
+            self.thickness_entry = ttk.Entry(editor_frame, textvariable=self.thickness_var, state="disabled")
+            self.thickness_entry.grid(row=4, column=1, sticky="ew", padx=4, pady=2)
+            self.thickness_var.trace_add("write", lambda *_: self._on_value_change("thickness"))
+
+            ttk.Label(editor_frame, text="Notiz:").grid(row=5, column=0, sticky="w", padx=4, pady=2)
+            self.note_var = tk.StringVar()
+            self.note_entry = ttk.Entry(editor_frame, textvariable=self.note_var, state="disabled")
+            self.note_entry.grid(row=5, column=1, sticky="ew", padx=4, pady=2)
+            self.note_var.trace_add("write", lambda *_: self._on_value_change("note"))
+
+            boundary_frame = ttk.LabelFrame(control_frame, text="Randbedingungen")
+            boundary_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+            boundary_frame.columnconfigure(1, weight=1)
+
+            self.T_left_var = tk.StringVar()
+            ttk.Label(boundary_frame, text="T_links [°C]:").grid(row=0, column=0, sticky="w", padx=4, pady=2)
+            ttk.Entry(boundary_frame, textvariable=self.T_left_var).grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+
+            self.T_inf_var = tk.StringVar()
+            ttk.Label(boundary_frame, text="T_∞ [°C]:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+            ttk.Entry(boundary_frame, textvariable=self.T_inf_var).grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+
+            self.h_var = tk.StringVar()
+            ttk.Label(boundary_frame, text="h [W/m²K]:").grid(row=2, column=0, sticky="w", padx=4, pady=2)
+            ttk.Entry(boundary_frame, textvariable=self.h_var).grid(row=2, column=1, sticky="ew", padx=4, pady=2)
+
+            action_frame = ttk.Frame(control_frame)
+            action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+            self.btn_calculate = ttk.Button(action_frame, text="Berechnen", command=self.calculate)
+            self.btn_calculate.pack(side=tk.LEFT, padx=4)
+
+            ttk.Button(action_frame, text="Aus Projekt laden", command=self.open_load_dialog).pack(side=tk.LEFT, padx=4)
+            ttk.Button(action_frame, text="Als Projekt speichern", command=self.open_save_dialog).pack(side=tk.LEFT, padx=4)
+
+            self.output_text = tk.Text(control_frame, height=12, wrap="word")
+            self.output_text.grid(row=3, column=0, sticky="nsew")
+            self.output_text.configure(state="disabled")
+
+            self.plot_frame = ttk.Frame(self.frame)
+            self.plot_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
+
+            self.plot_figure = Figure(figsize=(6, 3))
+            self.plot_ax = self.plot_figure.add_subplot(111)
+            self.plot_ax.set_xlabel("x [m]")
+            self.plot_ax.set_ylabel("T [°C]")
+            self.plot_ax.set_title("Temperaturprofil")
+            self.plot_ax.grid(True, linestyle="--", alpha=0.4)
+
+            self.plot_canvas = FigureCanvasTkAgg(self.plot_figure, master=self.plot_frame)
+            self.plot_canvas.draw()
+            self.plot_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+            self._update_button_states()
+
+        # ------------------------------------------------------------------
+        # Layer management
+        # ------------------------------------------------------------------
+
+        def refresh_material_options(self) -> None:
             try:
-                result = _calculate_with_callback(thicknesses, ks, T_left, T_inf, h)
+                materials = list_materials()
             except Exception as exc:
-                last_result["value"] = None
-                return False, str(exc)
+                messagebox.showerror("Fehler", f"Materialien konnten nicht geladen werden: {exc}")
+                materials = []
 
-            display_result(result)
-            try:
-                plot_temperature_profile(
-                    thicknesses,
-                    result["interface_temperatures"],
-                    result.get("temperature_positions_mm"),
-                    result.get("temperature_labels"),
-                )
-            except Exception as plot_error:
-                last_result["value"] = None
-                return False, str(plot_error)
+            self.materials = materials
+            self.material_lookup = {m.id: m for m in materials if m.id is not None}
+            self.material_names = [m.name for m in materials]
+            self.material_combo.configure(values=self.material_names)
 
-            last_inputs["value"] = inputs_signature
-            last_result["value"] = result
+            for row in self.layer_rows:
+                material_id = row.get("material_id")
+                if isinstance(material_id, int) and material_id in self.material_lookup:
+                    row["material_name"] = self.material_lookup[material_id].name
 
-        try:
-            save_project(
-                name,
-                thicknesses,
-                ks,
-                T_left,
-                T_inf,
-                h,
-                result,
-            )
-        except Exception as exc:
-            return False, str(exc)
+            for index in range(len(self.layer_rows)):
+                self._update_tree_row(index)
 
-        update_project_list()
-        return True, f"Projekt '{name}' gespeichert."
-
-    def load_selected_project() -> None:
-        try:
-            selection = project_listbox.curselection()
-            if not selection:
-                return
-            name = project_listbox.get(selection[0])
-        except Exception:
-            return
-
-        project = load_project(name)
-        if project:
-            entry_layers.delete(0, tk.END)
-            entry_layers.insert(0, str(len(project.thicknesses)))
-            entry_thickness.delete(0, tk.END)
-            entry_thickness.insert(0, ", ".join(map(str, project.thicknesses)))
-            entry_k.delete(0, tk.END)
-            entry_k.insert(0, ", ".join(map(str, project.ks)))
-            entry_T_left.delete(0, tk.END)
-            entry_T_left.insert(0, str(project.T_left))
-            entry_T_inf.delete(0, tk.END)
-            entry_T_inf.insert(0, str(project.T_inf))
-            entry_h.delete(0, tk.END)
-            entry_h.insert(0, str(project.h))
-
-            if project.result:
-                last_inputs["value"] = (
-                    tuple(project.thicknesses),
-                    tuple(project.ks),
-                    project.T_left,
-                    project.T_inf,
-                    project.h,
-                )
-                last_result["value"] = project.result
-                display_result(project.result)
-                if "interface_temperatures" in project.result and project.result[
-                    "interface_temperatures"
-                ]:
-                    try:
-                        plot_temperature_profile(
-                            project.thicknesses,
-                            project.result["interface_temperatures"],
-                            project.result.get("temperature_positions_mm"),
-                            project.result.get("temperature_labels"),
-                        )
-                    except Exception as exc:
-                        messagebox.showerror("Fehler", str(exc))
+        def add_layer(self) -> None:
+            if not self.materials:
+                row: Dict[str, object] = {
+                    "mode": "custom",
+                    "material_id": None,
+                    "material_name": "",
+                    "use_kT": False,
+                    "k_const": "",
+                    "thickness": "10",
+                    "note": "",
+                }
             else:
-                last_inputs["value"] = None
-                last_result["value"] = None
-                output.delete("1.0", tk.END)
-                output.insert(tk.END, "Kein Ergebnis im Projekt gespeichert.\n")
+                material = self.materials[0]
+                row = {
+                    "mode": "material",
+                    "material_id": material.id,
+                    "material_name": material.name,
+                    "use_kT": False,
+                    "k_const": "",
+                    "thickness": "10",
+                    "note": "",
+                }
 
-    def delete_selected_project() -> None:
-        try:
-            selection = project_listbox.curselection()
-            if not selection:
+            self.layer_rows.append(row)
+            self.refresh_tree(select_index=len(self.layer_rows) - 1)
+
+        def remove_layer(self) -> None:
+            if self.selected_index is None:
                 return
-            name = project_listbox.get(selection[0])
-        except Exception:
-            return
+            del self.layer_rows[self.selected_index]
+            new_index = None
+            if self.layer_rows:
+                new_index = min(self.selected_index, len(self.layer_rows) - 1)
+            self.refresh_tree(select_index=new_index)
 
-        if delete_project(name):
-            messagebox.showinfo("Erfolg", f"Projekt '{name}' gelöscht.")
-            update_project_list()
-        else:
-            messagebox.showerror("Fehler", "Löschen fehlgeschlagen.")
+        def move_layer(self, direction: int) -> None:
+            if self.selected_index is None:
+                return
+            new_index = self.selected_index + direction
+            if not (0 <= new_index < len(self.layer_rows)):
+                return
+            self.layer_rows[self.selected_index], self.layer_rows[new_index] = (
+                self.layer_rows[new_index],
+                self.layer_rows[self.selected_index],
+            )
+            self.refresh_tree(select_index=new_index)
 
-    def update_project_list() -> None:
-        project_listbox.delete(0, tk.END)
-        for name in get_all_project_names():
-            project_listbox.insert(tk.END, name)
+        def clear_layers(self) -> None:
+            self.layer_rows.clear()
+            self.refresh_tree(select_index=None)
 
-    def plot_temperature_profile(
-        thicknesses: Sequence[float],
-        temperatures: Sequence[float],
-        positions_mm: Optional[Sequence[float]] = None,
-        labels: Optional[Sequence[str]] = None,
-    ) -> None:
-        if positions_mm is None:
-            pos = [0.0]
-            for thickness in thicknesses:
-                pos.append(pos[-1] + thickness)
-            if len(temperatures) > len(pos):
-                pos.append(pos[-1])
-            positions = pos
-        else:
-            positions = list(positions_mm)
+        # ------------------------------------------------------------------
+        # Tree and form synchronisation
+        # ------------------------------------------------------------------
 
-        if len(positions) != len(temperatures):
-            raise ValueError("Positions- und Temperaturlisten müssen gleich lang sein.")
+        def refresh_tree(self, select_index: Optional[int] = None) -> None:
+            self.tree.delete(*self.tree.get_children())
+            self.tree_items = []
 
-        colors = ["#e81919", "#fce6e6"]
-        cmap = LinearSegmentedColormap.from_list("custom_cmap", colors, N=256)
+            for index in range(len(self.layer_rows)):
+                item = self.tree.insert("", tk.END, values=self._row_to_tree_values(index))
+                self.tree_items.append(item)
 
-        fig = Figure(figsize=(6, 4), dpi=100)
-        ax = fig.add_subplot(111)
-        ax.plot(positions, temperatures, linewidth=2, marker="o")
+            self._clear_error_highlights()
 
-        x_pos = 0.0
-        for index, thickness in enumerate(thicknesses):
-            color_value = index / (len(thicknesses) - 1) if len(thicknesses) > 1 else 0.5
-            color = cmap(color_value)
-            ax.axvspan(x_pos, x_pos + thickness, color=color, alpha=0.4)
-            x_pos += thickness
+            if select_index is None and self.layer_rows:
+                select_index = min(self.selected_index or 0, len(self.layer_rows) - 1)
 
-        last_index = len(temperatures) - 1
-        for idx, (x_val, temperature) in enumerate(zip(positions, temperatures)):
-            label = labels[idx] if labels and idx < len(labels) else ""
-            text = f"{temperature:.0f}°C"
-            if label and (idx == 0 or idx == last_index):
-                text = f"{label}\n{text}"
-            ax.text(x_val, temperature, text, ha="center", va="bottom", fontsize=8)
+            if select_index is not None and 0 <= select_index < len(self.layer_rows):
+                item_id = self.tree_items[select_index]
+                self.tree.selection_set(item_id)
+                self.tree.focus(item_id)
+                self.selected_index = select_index
+                self._load_row_into_form(select_index)
+            else:
+                self.tree.selection_remove(self.tree.selection())
+                self.selected_index = None
+                self._load_row_into_form(None)
 
-        ax.set_xlabel("Dicke [mm]")
-        ax.set_ylabel("Temperatur [°C]")
-        ax.set_title("Temperaturverlauf durch die Isolierung")
-        ax.grid(True, linestyle="--", alpha=0.6)
-        fig.tight_layout()
+            self._update_button_states()
 
-        for widget in frame_plot.winfo_children():
-            widget.destroy()
-        canvas = FigureCanvasTkAgg(fig, master=frame_plot)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        def _update_tree_row(self, index: int) -> None:
+            if 0 <= index < len(self.tree_items):
+                self.tree.item(self.tree_items[index], values=self._row_to_tree_values(index))
 
-    def save_dialog(parent: tk.Misc) -> None:
-        dialog = tk.Toplevel(parent)
-        dialog.title("Projekt speichern")
+        def _row_to_tree_values(self, index: int) -> Tuple[str, ...]:
+            row = self.layer_rows[index]
+            mode = str(row.get("mode", "material"))
+            material_text = row.get("material_name", "") if mode == "material" else ""
+            use_kT_text = "Ja" if row.get("use_kT") else "Nein"
+            k_const_text = row.get("k_const", "") if mode == "custom" else ""
+            thickness_text = row.get("thickness", "")
+            note_text = row.get("note", "")
+            return (
+                str(index + 1),
+                self.mode_display.get(mode, mode),
+                material_text,
+                use_kT_text,
+                k_const_text,
+                thickness_text,
+                note_text,
+            )
 
-        ttk.Label(dialog, text="Projektname:").pack(pady=5)
-        name_entry = ttk.Entry(dialog)
-        name_entry.pack(pady=5)
-        name_entry.focus_set()
+        def _on_tree_select(self, _event: tk.Event) -> None:
+            selection = self.tree.selection()
+            if not selection:
+                self.selected_index = None
+                self._load_row_into_form(None)
+                self._update_button_states()
+                return
+            item = selection[0]
+            index = self.tree.index(item)
+            self.selected_index = index
+            self._load_row_into_form(index)
+            self._update_button_states()
 
-        status_var = tk.StringVar(value="")
-        status_label = ttk.Label(dialog, textvariable=status_var, foreground="red")
-        status_label.pack(pady=(0, 5))
+        def _load_row_into_form(self, index: Optional[int]) -> None:
+            self.form_updating = True
+            if index is None:
+                self.form_enabled = False
+                self.mode_var.set("")
+                self.material_var.set("")
+                self.use_kT_var.set(False)
+                self.k_const_var.set("")
+                self.thickness_var.set("")
+                self.note_var.set("")
+            else:
+                row = self.layer_rows[index]
+                self.form_enabled = True
+                mode_text = self.mode_display.get(str(row.get("mode", "material")), "Material")
+                self.mode_var.set(mode_text)
+                self.material_var.set(row.get("material_name", ""))
+                self.use_kT_var.set(bool(row.get("use_kT", False)))
+                self.k_const_var.set(str(row.get("k_const", "")))
+                self.thickness_var.set(str(row.get("thickness", "")))
+                self.note_var.set(str(row.get("note", "")))
 
-        def on_save() -> None:
-            success, message = save_current_project(name_entry)
-            status_var.set(message)
-            status_label.configure(foreground="green" if success else "red")
-            if success:
+            self.form_updating = False
+            self._update_form_state()
+
+        def _update_form_state(self) -> None:
+            if not self.form_enabled:
+                self.mode_combo.configure(state="disabled")
+                self.material_combo.configure(state="disabled")
+                self.use_kT_check.state(["disabled"])
+                self.k_const_entry.configure(state="disabled")
+                self.thickness_entry.configure(state="disabled")
+                self.note_entry.configure(state="disabled")
+                return
+
+            mode_text = self.mode_var.get()
+            mode = self.mode_internal.get(mode_text, "material")
+
+            self.mode_combo.configure(state="readonly")
+            self.thickness_entry.configure(state="normal")
+            self.note_entry.configure(state="normal")
+
+            if mode == "material":
+                state = "readonly" if self.material_names else "disabled"
+                self.material_combo.configure(state=state)
+                self.use_kT_check.state(["!disabled"])
+                self.k_const_entry.configure(state="disabled")
+            else:
+                self.material_combo.configure(state="disabled")
+                self.use_kT_check.state(["disabled"])
+                self.k_const_entry.configure(state="normal")
+
+        def _on_mode_change(self) -> None:
+            if self.form_updating or self.selected_index is None:
+                return
+            mode_text = self.mode_var.get()
+            mode = self.mode_internal.get(mode_text)
+            if mode is None:
+                return
+            row = self.layer_rows[self.selected_index]
+            row["mode"] = mode
+            if mode == "material":
+                if not isinstance(row.get("material_id"), int) and self.materials:
+                    material = self.materials[0]
+                    row["material_id"] = material.id
+                    row["material_name"] = material.name
+                self.k_const_var.set("")
+                row["k_const"] = ""
+            else:
+                row["material_id"] = None
+                row["material_name"] = ""
+                row["use_kT"] = False
+                self.use_kT_var.set(False)
+
+            self._update_form_state()
+            self._clear_error_highlights()
+            self._update_tree_row(self.selected_index)
+
+        def _on_material_selected(self) -> None:
+            if self.selected_index is None or self.form_updating:
+                return
+            name = self.material_var.get()
+            material = next((m for m in self.materials if m.name == name), None)
+            if material is None:
+                return
+            row = self.layer_rows[self.selected_index]
+            row["mode"] = "material"
+            row["material_id"] = material.id
+            row["material_name"] = material.name
+            if self.mode_var.get() != self.mode_display["material"]:
+                self.mode_var.set(self.mode_display["material"])
+            self._update_form_state()
+            self._clear_error_highlights()
+            self._update_tree_row(self.selected_index)
+
+        def _on_use_kT_toggle(self) -> None:
+            if self.selected_index is None or self.form_updating:
+                return
+            row = self.layer_rows[self.selected_index]
+            row["use_kT"] = bool(self.use_kT_var.get())
+            self._clear_error_highlights()
+            self._update_tree_row(self.selected_index)
+
+        def _on_value_change(self, field: str) -> None:
+            if self.selected_index is None or self.form_updating:
+                return
+            if field == "k_const":
+                value = self.k_const_var.get().strip()
+            elif field == "thickness":
+                value = self.thickness_var.get().strip()
+            elif field == "note":
+                value = self.note_var.get()
+            else:
+                return
+            self.layer_rows[self.selected_index][field] = value
+            self._clear_error_highlights()
+            self._update_tree_row(self.selected_index)
+
+        def _update_button_states(self) -> None:
+            has_selection = self.selected_index is not None
+            has_rows = bool(self.layer_rows)
+            self.btn_remove.configure(state="normal" if has_selection else "disabled")
+            self.btn_up.configure(
+                state="normal" if has_selection and self.selected_index and self.selected_index > 0 else "disabled"
+            )
+            self.btn_down.configure(
+                state="normal"
+                if has_selection and self.selected_index is not None and self.selected_index < len(self.layer_rows) - 1
+                else "disabled"
+            )
+            self.btn_clear.configure(state="normal" if has_rows else "disabled")
+
+        def _clear_error_highlights(self) -> None:
+            for item in self.tree_items:
+                tags = set(self.tree.item(item, "tags"))
+                if "error" in tags:
+                    tags.remove("error")
+                    self.tree.item(item, tags=tuple(tags))
+
+        def _highlight_errors(self, indices: Sequence[int]) -> None:
+            for index in indices:
+                if 0 <= index < len(self.tree_items):
+                    tags = set(self.tree.item(self.tree_items[index], "tags"))
+                    tags.add("error")
+                    self.tree.item(self.tree_items[index], tags=tuple(tags))
+
+        # ------------------------------------------------------------------
+        # Validation and calculation
+        # ------------------------------------------------------------------
+
+        def _parse_float(self, value: str, field: str) -> float:
+            try:
+                return float(value.replace(",", "."))
+            except ValueError as exc:
+                raise ValueError(f"{field} muss eine Zahl sein.") from exc
+
+        def _parse_boundary_conditions(self) -> Tuple[float, float, float]:
+            T_left = self._parse_float(self.T_left_var.get().strip(), "T_links")
+            T_inf = self._parse_float(self.T_inf_var.get().strip(), "T_∞")
+            h_value = self._parse_float(self.h_var.get().strip(), "h")
+            if h_value <= 0:
+                raise ValueError("h muss größer als 0 sein.")
+            return T_left, T_inf, h_value
+
+        def _collect_layers(self) -> Tuple[List[Layer], List[str], List[int]]:
+            if not self.layer_rows:
+                return [], ["Mindestens eine Schicht ist erforderlich."], []
+
+            layers: List[Layer] = []
+            errors: List[str] = []
+            error_indices: List[int] = []
+
+            for index, row in enumerate(self.layer_rows):
+                mode = str(row.get("mode", "material"))
+
+                thickness_raw = str(row.get("thickness", "")).strip()
+                if not thickness_raw:
+                    errors.append(f"Zeile {index + 1}: Dicke muss angegeben werden.")
+                    error_indices.append(index)
+                    continue
+                try:
+                    thickness = self._parse_float(thickness_raw, "Dicke")
+                except ValueError as exc:
+                    errors.append(f"Zeile {index + 1}: {exc}")
+                    error_indices.append(index)
+                    continue
+                if thickness <= 0:
+                    errors.append(f"Zeile {index + 1}: Dicke muss größer als 0 sein.")
+                    error_indices.append(index)
+                    continue
+
+                note = (str(row.get("note", "")).strip() or None)
+
+                if mode == "material":
+                    material_id = row.get("material_id")
+                    if not isinstance(material_id, int):
+                        errors.append(f"Zeile {index + 1}: Bitte ein Material auswählen.")
+                        error_indices.append(index)
+                        continue
+                    material = self.material_lookup.get(material_id)
+                    if material is None:
+                        try:
+                            material = get_material(material_id)
+                            self.material_lookup[material_id] = material
+                        except Exception:
+                            errors.append(
+                                f"Zeile {index + 1}: Material mit ID {material_id} ist nicht verfügbar."
+                            )
+                            error_indices.append(index)
+                            continue
+                    row["material_name"] = material.name
+                    use_kT = bool(row.get("use_kT", False))
+                    if use_kT and not material.k_points and material.k_const is None:
+                        errors.append(
+                            f"Zeile {index + 1}: Material '{material.name}' enthält keine k(T)-Daten."
+                        )
+                        error_indices.append(index)
+                        continue
+                    if not use_kT and material.k_const is None:
+                        errors.append(
+                            f"Zeile {index + 1}: Material '{material.name}' hat keinen konstanten k-Wert."
+                        )
+                        error_indices.append(index)
+                        continue
+                    try:
+                        layer_obj = Layer(
+                            thickness_mm=thickness,
+                            mode="material",
+                            material_id=material_id,
+                            use_kT=use_kT,
+                            k_const=None,
+                            note=note,
+                        )
+                    except ValueError as exc:
+                        errors.append(f"Zeile {index + 1}: {exc}")
+                        error_indices.append(index)
+                        continue
+                    layers.append(layer_obj)
+                else:
+                    if row.get("use_kT"):
+                        errors.append(f"Zeile {index + 1}: Custom-Schichten unterstützen kein k(T).")
+                        error_indices.append(index)
+                        continue
+                    k_const_raw = str(row.get("k_const", "")).strip()
+                    if not k_const_raw:
+                        errors.append(f"Zeile {index + 1}: k_const muss angegeben werden.")
+                        error_indices.append(index)
+                        continue
+                    try:
+                        k_const = self._parse_float(k_const_raw, "k_const")
+                    except ValueError as exc:
+                        errors.append(f"Zeile {index + 1}: {exc}")
+                        error_indices.append(index)
+                        continue
+                    if k_const <= 0:
+                        errors.append(f"Zeile {index + 1}: k_const muss größer als 0 sein.")
+                        error_indices.append(index)
+                        continue
+                    try:
+                        layer_obj = Layer(
+                            thickness_mm=thickness,
+                            mode="custom",
+                            material_id=None,
+                            use_kT=False,
+                            k_const=k_const,
+                            note=note,
+                        )
+                    except ValueError as exc:
+                        errors.append(f"Zeile {index + 1}: {exc}")
+                        error_indices.append(index)
+                        continue
+                    layers.append(layer_obj)
+
+            return layers, errors, error_indices
+
+        def calculate(self) -> None:
+            self._clear_error_highlights()
+            try:
+                T_left, T_inf, h_value = self._parse_boundary_conditions()
+            except ValueError as exc:
+                messagebox.showerror("Validierungsfehler", str(exc))
+                return
+
+            self.refresh_material_options()
+            layers, errors, error_indices = self._collect_layers()
+            if errors:
+                self._highlight_errors(error_indices)
+                messagebox.showerror("Validierungsfehler", "\n".join(errors))
+                return
+
+            try:
+                if any(layer.use_kT for layer in layers):
+                    result = solve_multilayer_kT(layers, T_left, T_inf, h_value)
+                else:
+                    result = compute_multilayer_layers(layers, T_left, T_inf, h_value)
+            except Exception as exc:
+                messagebox.showerror("Berechnungsfehler", str(exc))
+                return
+
+            self._display_result(layers, result, T_inf)
+            self._update_plot(layers, result)
+
+        def _display_result(
+            self, layers: Sequence[Layer], result: Dict[str, object], T_inf: float
+        ) -> None:
+            lines: List[str] = []
+            q_value = result.get("q_W_m2")
+            if isinstance(q_value, (int, float)):
+                lines.append(f"Wärmestromdichte q = {q_value:.3f} W/m²")
+
+            interface_T = result.get("interface_T_C")
+            if isinstance(interface_T, Sequence):
+                lines.append("")
+                lines.append("Grenzflächentemperaturen:")
+                for idx, temp in enumerate(interface_T):
+                    if not isinstance(temp, (int, float)):
+                        continue
+                    if idx == 0:
+                        label = "T_links"
+                    elif idx == len(interface_T) - 1:
+                        label = "Oberfläche"
+                    else:
+                        label = self._layer_label(layers[idx - 1], idx - 1)
+                    lines.append(f"  {label}: {temp:.2f} °C")
+
+            lines.append(f"T_∞: {T_inf:.2f} °C")
+            self._set_output_text("\n".join(lines))
+
+        def _layer_label(self, layer: Layer, index: int) -> str:
+            note = (layer.note or "").strip()
+            if note:
+                return note
+            if layer.mode == "material" and layer.material_id is not None:
+                material = self.material_lookup.get(layer.material_id)
+                if material:
+                    return material.name
+                try:
+                    material = get_material(layer.material_id)
+                    self.material_lookup[layer.material_id] = material
+                    return material.name
+                except Exception:
+                    return f"Material {layer.material_id}"
+            return f"Schicht {index + 1}"
+
+        def _update_plot(self, layers: Sequence[Layer], result: Dict[str, object]) -> None:
+            x_values = result.get("x_m")
+            temps = result.get("T_profile_C")
+            if not isinstance(x_values, Sequence) or not isinstance(temps, Sequence):
+                return
+
+            self.plot_ax.clear()
+            self.plot_ax.set_xlabel("x [m]")
+            self.plot_ax.set_ylabel("T [°C]")
+            self.plot_ax.grid(True, linestyle="--", alpha=0.4)
+
+            (line,) = self.plot_ax.plot(x_values, temps, color="tab:red", label="Temperaturprofil")
+
+            boundaries = [0.0]
+            for layer in layers:
+                boundaries.append(boundaries[-1] + layer.thickness_mm / 1000.0)
+
+            for boundary in boundaries[1:-1]:
+                self.plot_ax.axvline(boundary, color="gray", linestyle="--", alpha=0.6)
+
+            cmap = cm.get_cmap("tab20", max(len(layers), 1))
+            legend_handles = [line]
+            for idx, layer in enumerate(layers):
+                color = cmap(idx)
+                left = boundaries[idx]
+                right = boundaries[idx + 1]
+                self.plot_ax.axvspan(left, right, color=color, alpha=0.15)
+                legend_handles.append(
+                    Patch(facecolor=color, edgecolor="none", label=self._layer_label(layer, idx))
+                )
+
+            self.plot_ax.legend(handles=legend_handles, loc="best")
+            self.plot_figure.tight_layout()
+            self.plot_canvas.draw_idle()
+
+        def _set_output_text(self, text: str) -> None:
+            self.output_text.configure(state="normal")
+            self.output_text.delete("1.0", tk.END)
+            self.output_text.insert(tk.END, text)
+            self.output_text.configure(state="disabled")
+
+        # ------------------------------------------------------------------
+        # Project handling
+        # ------------------------------------------------------------------
+
+        def open_load_dialog(self) -> None:
+            try:
+                project_names = get_all_project_names()
+            except Exception as exc:
+                messagebox.showerror("Fehler", f"Projekte konnten nicht geladen werden: {exc}")
+                return
+            if not project_names:
+                messagebox.showinfo("Projekte", "Keine gespeicherten Projekte vorhanden.")
+                return
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Projekt laden")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            ttk.Label(dialog, text="Projekt:").pack(padx=10, pady=(10, 0))
+
+            name_var = tk.StringVar(value=project_names[0])
+            combo = ttk.Combobox(dialog, textvariable=name_var, values=project_names, state="readonly")
+            combo.pack(padx=10, pady=5, fill="x")
+            combo.focus_set()
+
+            status_var = tk.StringVar()
+            status_label = ttk.Label(dialog, textvariable=status_var, foreground="red")
+            status_label.pack(padx=10, pady=(0, 5), fill="x")
+
+            def on_load() -> None:
+                name = name_var.get().strip()
+                if not name:
+                    status_var.set("Bitte ein Projekt wählen.")
+                    return
+                try:
+                    project = load_project(name)
+                except Exception as exc:
+                    status_var.set(str(exc))
+                    return
+                dialog.destroy()
+                self._apply_project(project)
+
+            ttk.Button(dialog, text="Laden", command=on_load).pack(padx=10, pady=(0, 5))
+            ttk.Button(dialog, text="Abbrechen", command=dialog.destroy).pack(padx=10, pady=(0, 10))
+
+        def _apply_project(self, project: Project) -> None:
+            self.refresh_material_options()
+
+            self.T_left_var.set(f"{project.T_left_C:g}")
+            self.T_inf_var.set(f"{project.T_inf_C:g}")
+            self.h_var.set(f"{project.h_W_m2K:g}")
+
+            rows: List[Dict[str, object]] = []
+            for layer in project.layers:
+                row: Dict[str, object] = {
+                    "mode": layer.mode,
+                    "material_id": layer.material_id,
+                    "material_name": "",
+                    "use_kT": layer.use_kT,
+                    "k_const": "",
+                    "thickness": f"{layer.thickness_mm:g}",
+                    "note": layer.note or "",
+                }
+                if layer.mode == "material" and layer.material_id is not None:
+                    material = self.material_lookup.get(layer.material_id)
+                    if material is None:
+                        try:
+                            material = get_material(layer.material_id)
+                            self.material_lookup[layer.material_id] = material
+                        except Exception:
+                            material = None
+                    if material is not None:
+                        row["material_name"] = material.name
+                else:
+                    if layer.k_const is not None:
+                        row["k_const"] = f"{layer.k_const:g}"
+                rows.append(row)
+
+            self.layer_rows = rows
+            self.refresh_tree(select_index=0 if self.layer_rows else None)
+
+        def open_save_dialog(self) -> None:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Als Projekt speichern")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            ttk.Label(dialog, text="Projektname:").pack(padx=10, pady=(10, 0))
+
+            name_var = tk.StringVar()
+            entry = ttk.Entry(dialog, textvariable=name_var)
+            entry.pack(padx=10, pady=5, fill="x")
+            entry.focus_set()
+
+            status_var = tk.StringVar()
+            status_label = ttk.Label(dialog, textvariable=status_var, foreground="red")
+            status_label.pack(padx=10, pady=(0, 5), fill="x")
+
+            def on_save() -> None:
+                name = name_var.get().strip()
+                if not name:
+                    status_var.set("Bitte einen Projektnamen eingeben.")
+                    return
+                try:
+                    T_left, T_inf, h_value = self._parse_boundary_conditions()
+                except ValueError as exc:
+                    status_var.set(str(exc))
+                    messagebox.showerror("Validierungsfehler", str(exc))
+                    return
+
+                self.refresh_material_options()
+                layers, errors, error_indices = self._collect_layers()
+                if errors:
+                    self._highlight_errors(error_indices)
+                    messagebox.showerror("Validierungsfehler", "\n".join(errors))
+                    status_var.set(errors[0])
+                    return
+
+                project = Project(
+                    name=name,
+                    layers=layers,
+                    T_left_C=T_left,
+                    T_inf_C=T_inf,
+                    h_W_m2K=h_value,
+                )
+
+                try:
+                    save_project(project)
+                except Exception as exc:
+                    status_var.set(str(exc))
+                    messagebox.showerror("Fehler", str(exc))
+                    return
+
+                status_label.configure(foreground="green")
+                status_var.set(f"Projekt '{name}' gespeichert.")
                 dialog.after(1500, dialog.destroy)
 
-        ttk.Button(dialog, text="Speichern", command=on_save).pack(pady=5)
-        ttk.Button(dialog, text="Abbrechen", command=dialog.destroy).pack(pady=(0, 5))
+            ttk.Button(dialog, text="Speichern", command=on_save).pack(padx=10, pady=(0, 5))
+            ttk.Button(dialog, text="Abbrechen", command=dialog.destroy).pack(padx=10, pady=(0, 10))
 
-    # --- Hauptelemente der UI ---
+        def on_tab_changed(self, event: tk.Event) -> None:
+            selected = event.widget.select()
+            if selected == str(self.frame):
+                self.refresh_material_options()
+
     root = tk.Tk()
     root.title("Heatrix - Isolierung - Temperaturberechnung")
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
-    # Tab 1: Berechnung
-    tab1 = ttk.Frame(notebook)
-    notebook.add(tab1, text="Berechnung")
+    calculation_tab = CalculationTab(notebook)
+    notebook.bind("<<NotebookTabChanged>>", calculation_tab.on_tab_changed)
 
-    ttk.Label(tab1, text="Anzahl Schichten:").grid(row=0, column=0, sticky="w")
-    entry_layers = ttk.Entry(tab1)
-    entry_layers.grid(row=0, column=1)
-
-    ttk.Label(tab1, text="Dicken [mm] (kommagetrennt):").grid(row=1, column=0, sticky="w")
-    entry_thickness = ttk.Entry(tab1, width=40)
-    entry_thickness.grid(row=1, column=1)
-
-    ttk.Label(tab1, text="Wärmeleitwerte k [W/mK] (kommagetrennt):").grid(
-        row=2, column=0, sticky="w"
-    )
-    entry_k = ttk.Entry(tab1, width=40)
-    entry_k.grid(row=2, column=1)
-
-    ttk.Label(tab1, text="T_links [°C]:").grid(row=3, column=0, sticky="w")
-    entry_T_left = ttk.Entry(tab1)
-    entry_T_left.grid(row=3, column=1)
-
-    ttk.Label(tab1, text="T_∞ [°C]:").grid(row=4, column=0, sticky="w")
-    entry_T_inf = ttk.Entry(tab1)
-    entry_T_inf.grid(row=4, column=1)
-
-    ttk.Label(tab1, text="h [W/m²K]:").grid(row=5, column=0, sticky="w")
-    entry_h = ttk.Entry(tab1)
-    entry_h.grid(row=5, column=1)
-
-    ttk.Button(tab1, text="Berechnen", command=calculate).grid(row=6, column=0, pady=5)
-    ttk.Button(tab1, text="Speichern", command=lambda: save_dialog(tab1)).grid(
-        row=6, column=1, pady=5
-    )
-
-    output = tk.Text(tab1, height=10, width=60)
-    output.grid(row=7, column=0, columnspan=2, pady=5)
-
-    frame_plot = ttk.Frame(tab1, width=600, height=400)
-    frame_plot.grid(row=8, column=0, columnspan=2, sticky="nsew", pady=10)
-
-    tab1.grid_columnconfigure(1, weight=1)
-    tab1.grid_rowconfigure(8, weight=1)
-
-    # Tab 2: Projekte
-    tab2 = ttk.Frame(notebook)
-    notebook.add(tab2, text="Projekte")
-
-    project_listbox = tk.Listbox(tab2, width=40, height=10)
-    project_listbox.pack(pady=10, fill="both", expand=True)
-    update_project_list()
-
-    button_frame = ttk.Frame(tab2)
-    button_frame.pack(pady=5)
-
-    ttk.Button(button_frame, text="Laden", command=load_selected_project).pack(
-        side=tk.LEFT, padx=5
-    )
-    ttk.Button(button_frame, text="Löschen", command=delete_selected_project).pack(
-        side=tk.LEFT, padx=5
-    )
-
-    # Tab 3: Materialien
     MaterialTab(notebook)
 
     root.mainloop()
