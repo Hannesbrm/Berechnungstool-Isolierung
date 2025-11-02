@@ -5,11 +5,12 @@ und einem zweiten Tab für die Projektverwaltung.
 """
 
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
-from typing import List, Optional
-import matplotlib.pyplot as plt
+from typing import Callable, List, Optional, Sequence, Tuple
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
 from Isolierung_logic import (
     compute_multilayer,
     save_project,
@@ -19,38 +20,72 @@ from Isolierung_logic import (
 )
 
 
-def run_ui(calculate_callback=None):
+@dataclass
+class CalculationInput:
+    thicknesses: List[float]
+    ks: List[float]
+    T_left: float
+    T_inf: float
+    h: float
+
+
+def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], float, float, float], dict]] = None):
     # --- Hilfsfunktionen ---
-    def calculate():
+    def _parse_float_list(entry: tk.Entry, description: str) -> List[float]:
+        raw_values = [value.strip() for value in entry.get().split(',') if value.strip()]
         try:
-            n = int(entry_layers.get())
-            thicknesses = [float(x.strip()) for x in entry_thickness.get().split(',') if x.strip() != ""]
-            ks = [float(x.strip()) for x in entry_k.get().split(',') if x.strip() != ""]
+            return [float(value) for value in raw_values]
+        except ValueError as exc:
+            raise ValueError(f"{description} müssen numerisch sein.") from exc
 
-            if len(thicknesses) != n or len(ks) != n:
-                messagebox.showerror("Fehler", "Anzahl der Werte muss der Schichtanzahl entsprechen.")
-                return
+    def _validate_positive(values: Sequence[float], description: str) -> None:
+        if any(value <= 0 for value in values):
+            raise ValueError(f"Alle {description} müssen > 0 sein.")
 
-            # Plausibilitätsprüfungen
-            if any(t <= 0 for t in thicknesses):
-                messagebox.showerror("Fehler", "Alle Dicken müssen > 0 sein.")
-                return
-            if any(k <= 0 for k in ks):
-                messagebox.showerror("Fehler", "Alle Wärmeleitwerte müssen > 0 sein.")
-                return
+    def _parse_inputs() -> CalculationInput:
+        try:
+            n_layers = int(entry_layers.get())
+        except ValueError as exc:
+            raise ValueError("Schichtanzahl muss eine ganze Zahl sein.") from exc
+        if n_layers <= 0:
+            raise ValueError("Schichtanzahl muss > 0 sein.")
 
+        thicknesses = _parse_float_list(entry_thickness, "Dicken")
+        ks = _parse_float_list(entry_k, "Wärmeleitwerte")
+
+        if len(thicknesses) != n_layers or len(ks) != n_layers:
+            raise ValueError("Anzahl der Werte muss der Schichtanzahl entsprechen.")
+
+        _validate_positive(thicknesses, "Dicken")
+        _validate_positive(ks, "Wärmeleitwerte")
+
+        try:
             T_left = float(entry_T_left.get())
             T_inf = float(entry_T_inf.get())
-            h = float(entry_h.get())
+            h_value = float(entry_h.get())
+        except ValueError as exc:
+            raise ValueError("Temperaturen und h müssen numerisch sein.") from exc
 
-            # **Hier wird der Callback genutzt, falls übergeben**
-            if calculate_callback:
-                result = calculate_callback(thicknesses, ks, T_left, T_inf, h)
-            else:
-                result = compute_multilayer(thicknesses, ks, T_left, T_inf, h)
+        if h_value <= 0:
+            raise ValueError("Wärmeübergangskoeffizient h muss > 0 sein.")
 
+        return CalculationInput(thicknesses, ks, T_left, T_inf, h_value)
+
+    def _calculate_with_callback(inputs: CalculationInput):
+        callback = calculate_callback or compute_multilayer
+        return callback(inputs.thicknesses, inputs.ks, inputs.T_left, inputs.T_inf, inputs.h)
+
+    def calculate():
+        try:
+            inputs = _parse_inputs()
+            result = _calculate_with_callback(inputs)
             display_result(result)
-            plot_temperature_profile(thicknesses, result['interface_temperatures'])
+            plot_temperature_profile(
+                inputs.thicknesses,
+                result['interface_temperatures'],
+                result.get('temperature_positions_mm'),
+                result.get('temperature_labels'),
+            )
 
         except Exception as e:
             messagebox.showerror("Fehler", str(e))
@@ -60,9 +95,11 @@ def run_ui(calculate_callback=None):
         try:
             output.insert(tk.END, f"Wärmestromdichte q = {result['q']:.3f} W/m²\n")
             output.insert(tk.END, f"Gesamtwiderstand = {result['R_total']:.5f} m²K/W\n\n")
-            output.insert(tk.END, "Temperaturen an Grenzflächen (°C):\n")
+            output.insert(tk.END, "Temperaturen entlang des Pfades (°C):\n")
+            labels = result.get('temperature_labels')
             for i, T in enumerate(result['interface_temperatures']):
-                output.insert(tk.END, f"  Grenzfläche {i}: {T:.2f}\n")
+                label = labels[i] if labels and i < len(labels) else f"Grenzfläche {i}"
+                output.insert(tk.END, f"  {label}: {T:.2f}\n")
         except Exception as e:
             output.insert(tk.END, f"Fehler beim Anzeigen des Ergebnisses: {e}\n")
 
@@ -72,14 +109,9 @@ def run_ui(calculate_callback=None):
             messagebox.showerror("Fehler", "Bitte einen Projektnamen eingeben.")
             return
         try:
-            n = int(entry_layers.get())
-            thicknesses = [float(x.strip()) for x in entry_thickness.get().split(',') if x.strip() != ""]
-            ks = [float(x.strip()) for x in entry_k.get().split(',') if x.strip() != ""]
-            T_left = float(entry_T_left.get())
-            T_inf = float(entry_T_inf.get())
-            h = float(entry_h.get())
-            result = compute_multilayer(thicknesses, ks, T_left, T_inf, h)
-            if save_project(name, thicknesses, ks, T_left, T_inf, h, result):
+            inputs = _parse_inputs()
+            result = _calculate_with_callback(inputs)
+            if save_project(name, inputs.thicknesses, inputs.ks, inputs.T_left, inputs.T_inf, inputs.h, result):
                 messagebox.showinfo("Erfolg", f"Projekt '{name}' gespeichert.")
                 update_project_list()
             else:
@@ -119,7 +151,15 @@ def run_ui(calculate_callback=None):
                 display_result(project.result)
                 # Schnittstellen-Temperaturen prüfen
                 if 'interface_temperatures' in project.result and project.result['interface_temperatures']:
-                    plot_temperature_profile(project.thicknesses, project.result['interface_temperatures'])
+                    try:
+                        plot_temperature_profile(
+                            project.thicknesses,
+                            project.result['interface_temperatures'],
+                            project.result.get('temperature_positions_mm'),
+                            project.result.get('temperature_labels'),
+                        )
+                    except Exception as e:
+                        messagebox.showerror("Fehler", str(e))
             else:
                 output.delete('1.0', tk.END)
                 output.insert(tk.END, "Kein Ergebnis im Projekt gespeichert.\n")
@@ -144,35 +184,49 @@ def run_ui(calculate_callback=None):
         for name in get_all_project_names():
             project_listbox.insert(tk.END, name)
 
-    def plot_temperature_profile(thicknesses: List[float], temperatures: List[float]):
-        # Schließe alte Figuren, um Speicherlecks bei häufigen Neuzeichnungen zu vermeiden
-        plt.close("all")
+    def plot_temperature_profile(
+        thicknesses: List[float],
+        temperatures: List[float],
+        positions_mm: Optional[List[float]] = None,
+        labels: Optional[List[str]] = None,
+    ):
+        if positions_mm is None:
+            positions_mm = [0.0]
+            for t in thicknesses:
+                positions_mm.append(positions_mm[-1] + t)
+            if len(temperatures) > len(positions_mm):
+                positions_mm.append(positions_mm[-1])
 
-        # x in mm (wie Eingabe) — konsistent zur UI-Beschriftung
-        total_x = [0]
-        for t in thicknesses:
-            total_x.append(total_x[-1] + t)
+        if len(positions_mm) != len(temperatures):
+            raise ValueError("Positions- und Temperaturlisten müssen gleich lang sein.")
 
         colors = ["#e81919", "#fce6e6"]
         cmap = LinearSegmentedColormap.from_list("custom_cmap", colors, N=256)
 
-        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
-        ax.plot(total_x, temperatures, linewidth=2, marker='o')
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.plot(positions_mm, temperatures, linewidth=2, marker='o')
 
-        x_pos = 0
+        x_pos = 0.0
         for i, t in enumerate(thicknesses):
             color_value = i / (len(thicknesses) - 1) if len(thicknesses) > 1 else 0.5
             color = cmap(color_value)
             ax.axvspan(x_pos, x_pos + t, color=color, alpha=0.4)
             x_pos += t
 
-        for x, T in zip(total_x, temperatures):
-            ax.text(x, T, f"{T:.0f}°C", ha='center', va='bottom', fontsize=8)
+        last_index = len(temperatures) - 1
+        for idx, (x, T) in enumerate(zip(positions_mm, temperatures)):
+            label = labels[idx] if labels and idx < len(labels) else ""
+            text = f"{T:.0f}°C"
+            if label and (idx == 0 or idx == last_index):
+                text = f"{label}\n{text}"
+            ax.text(x, T, text, ha='center', va='bottom', fontsize=8)
 
         ax.set_xlabel('Dicke [mm]')
         ax.set_ylabel('Temperatur [°C]')
         ax.set_title('Temperaturverlauf durch die Isolierung')
         ax.grid(True, linestyle='--', alpha=0.6)
+        fig.tight_layout()
 
         # Canvas im frame_plot ersetzen
         for widget in frame_plot.winfo_children():
