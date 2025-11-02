@@ -21,6 +21,9 @@ from Isolierung_logic import (
 
 def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], float, float, float], dict]] = None):
     # --- Hilfsfunktionen ---
+    last_inputs: dict = {"value": None}
+    last_result: dict = {"value": None}
+
     def _parse_inputs() -> Tuple[List[float], List[float], float, float, float]:
         n = int(entry_layers.get())
         thicknesses = [float(x.strip()) for x in entry_thickness.get().split(',') if x.strip() != ""]
@@ -46,6 +49,8 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
         try:
             thicknesses, ks, T_left, T_inf, h = _parse_inputs()
             result = _calculate_with_callback(thicknesses, ks, T_left, T_inf, h)
+            last_inputs["value"] = (tuple(thicknesses), tuple(ks), T_left, T_inf, h)
+            last_result["value"] = result
             display_result(result)
             plot_temperature_profile(
                 thicknesses,
@@ -55,6 +60,7 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
             )
 
         except Exception as e:
+            last_result["value"] = None
             messagebox.showerror("Fehler", str(e))
 
     def display_result(result: dict):
@@ -70,23 +76,51 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
         except Exception as e:
             output.insert(tk.END, f"Fehler beim Anzeigen des Ergebnisses: {e}\n")
 
-    def save_current_project(name_entry: tk.Entry):
-        name = name_entry.get()
+    def save_current_project(name_entry: tk.Entry) -> Tuple[bool, str]:
+        name = name_entry.get().strip()
         if not name:
-            messagebox.showerror("Fehler", "Bitte einen Projektnamen eingeben.")
-            return
+            return False, "Bitte einen Projektnamen eingeben."
+
         try:
             thicknesses, ks, T_left, T_inf, h = _parse_inputs()
-            result = _calculate_with_callback(thicknesses, ks, T_left, T_inf, h)
-            if save_project(name, thicknesses, ks, T_left, T_inf, h, result):
-                messagebox.showinfo("Erfolg", f"Projekt '{name}' gespeichert.")
-                update_project_list()
-            else:
-                messagebox.showerror("Fehler", "Speichern fehlgeschlagen.")
         except ValueError as ve:
-            messagebox.showerror("Fehler", f"Ungültige Eingabe: {ve}")
+            return False, f"Ungültige Eingabe: {ve}"
         except Exception as e:
-            messagebox.showerror("Fehler", str(e))
+            return False, str(e)
+
+        inputs_signature = (tuple(thicknesses), tuple(ks), T_left, T_inf, h)
+
+        if last_inputs["value"] == inputs_signature and last_result.get("value"):
+            result = last_result["value"]
+        else:
+            try:
+                result = _calculate_with_callback(thicknesses, ks, T_left, T_inf, h)
+            except Exception as e:
+                last_result["value"] = None
+                return False, str(e)
+
+            display_result(result)
+            try:
+                plot_temperature_profile(
+                    thicknesses,
+                    result['interface_temperatures'],
+                    result.get('temperature_positions_mm'),
+                    result.get('temperature_labels'),
+                )
+            except Exception as plot_error:
+                last_result["value"] = None
+                return False, str(plot_error)
+
+            last_inputs["value"] = inputs_signature
+            last_result["value"] = result
+
+        if save_project(name, thicknesses, ks, T_left, T_inf, h, result):
+            update_project_list()
+            last_inputs["value"] = inputs_signature
+            last_result["value"] = result
+            return True, f"Projekt '{name}' gespeichert."
+
+        return False, "Speichern fehlgeschlagen."
 
     def load_selected_project():
         # sichere Abfrage des aktuell markierten Eintrags
@@ -115,6 +149,14 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
 
             # project.result kann None sein — prüfen
             if project.result:
+                last_inputs["value"] = (
+                    tuple(project.thicknesses),
+                    tuple(project.ks),
+                    project.T_left,
+                    project.T_inf,
+                    project.h,
+                )
+                last_result["value"] = project.result
                 display_result(project.result)
                 # Schnittstellen-Temperaturen prüfen
                 if 'interface_temperatures' in project.result and project.result['interface_temperatures']:
@@ -128,6 +170,8 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
                     except Exception as e:
                         messagebox.showerror("Fehler", str(e))
             else:
+                last_inputs["value"] = None
+                last_result["value"] = None
                 output.delete('1.0', tk.END)
                 output.insert(tk.END, "Kein Ergebnis im Projekt gespeichert.\n")
 
@@ -209,15 +253,21 @@ def run_ui(calculate_callback: Optional[Callable[[List[float], List[float], floa
         tk.Label(dialog, text="Projektname:").pack(pady=5)
         name_entry = tk.Entry(dialog)
         name_entry.pack(pady=5)
+        name_entry.focus_set()
 
-        tk.Button(
-            dialog,
-            text="Speichern",
-            command=lambda: [
-                save_current_project(name_entry),
-                dialog.destroy()
-            ]
-        ).pack(pady=5)
+        status_var = tk.StringVar(value="")
+        status_label = tk.Label(dialog, textvariable=status_var, fg="red")
+        status_label.pack(pady=(0, 5))
+
+        def on_save():
+            success, message = save_current_project(name_entry)
+            status_var.set(message)
+            status_label.configure(fg="green" if success else "red")
+            if success:
+                dialog.after(1500, dialog.destroy)
+
+        tk.Button(dialog, text="Speichern", command=on_save).pack(pady=5)
+        tk.Button(dialog, text="Abbrechen", command=dialog.destroy).pack(pady=(0, 5))
 
     # --- Hauptelemente der UI ---
     root = tk.Tk()
